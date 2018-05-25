@@ -6,19 +6,17 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/user"
-	"path"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	flags "github.com/jessevdk/go-flags"
+	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/brontide"
 	"github.com/lightningnetwork/lnd/htlcswitch/hodl"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -125,6 +123,14 @@ type bitcoindConfig struct {
 	RPCUser string `long:"rpcuser" description:"Username for RPC connections"`
 	RPCPass string `long:"rpcpass" default-mask:"-" description:"Password for RPC connections"`
 	ZMQPath string `long:"zmqpath" description:"The path to the ZMQ socket providing at least raw blocks. Raw transactions can be handled as well."`
+}
+
+type Backend interface {
+	ParseRPCParams(cConfig *chainConfig, net chainCode, funcName string) error
+
+	NewChainControlFromConfig(cfg *config, chanDB *channeldb.DB,
+		privateWalletPw, publicWalletPw []byte, birthday time.Time,
+		recoveryWindow uint32) (*chainControl, func(), error)
 }
 
 type autoPilotConfig struct {
@@ -465,8 +471,8 @@ func loadConfig() (*config, error) {
 
 		switch cfg.Litecoin.Node {
 		case "ltcd":
-			err := parseRPCParams(cfg.Litecoin, cfg.LtcdMode,
-				litecoinChain, funcName)
+			err := cfg.LtcdMode.ParseRPCParams(cfg.Litecoin, litecoinChain,
+				funcName)
 			if err != nil {
 				err := fmt.Errorf("unable to load RPC "+
 					"credentials for ltcd: %v", err)
@@ -477,7 +483,7 @@ func loadConfig() (*config, error) {
 				return nil, fmt.Errorf("%s: litecoind does not "+
 					"support simnet", funcName)
 			}
-			err := parseRPCParams(cfg.Litecoin, cfg.LitecoindMode,
+			err := cfg.LitecoindMode.ParseRPCParams(cfg.Litecoin,
 				litecoinChain, funcName)
 			if err != nil {
 				err := fmt.Errorf("unable to load RPC "+
@@ -553,9 +559,8 @@ func loadConfig() (*config, error) {
 
 		switch cfg.Bitcoin.Node {
 		case "btcd":
-			err := parseRPCParams(
-				cfg.Bitcoin, cfg.BtcdMode, bitcoinChain, funcName,
-			)
+			err := cfg.BtcdMode.ParseRPCParams(cfg.Bitcoin, bitcoinChain,
+				funcName)
 			if err != nil {
 				err := fmt.Errorf("unable to load RPC "+
 					"credentials for btcd: %v", err)
@@ -567,9 +572,8 @@ func loadConfig() (*config, error) {
 					"support simnet", funcName)
 			}
 
-			err := parseRPCParams(
-				cfg.Bitcoin, cfg.BitcoindMode, bitcoinChain, funcName,
-			)
+			err := cfg.BitcoindMode.ParseRPCParams(cfg.Bitcoin, bitcoinChain,
+				funcName)
 			if err != nil {
 				err := fmt.Errorf("unable to load RPC "+
 					"credentials for bitcoind: %v", err)
@@ -860,251 +864,6 @@ func noiseDial(idPriv *btcec.PrivateKey) func(net.Addr) (net.Conn, error) {
 	}
 }
 
-func parseRPCParams(cConfig *chainConfig, nodeConfig interface{}, net chainCode,
-	funcName string) error {
-
-	// First, we'll check our node config to make sure the RPC parameters
-	// were set correctly. We'll also determine the path to the conf file
-	// depending on the backend node.
-	var daemonName, confDir, confFile string
-	switch conf := nodeConfig.(type) {
-	case *btcdConfig:
-		// If both RPCUser and RPCPass are set, we assume those
-		// credentials are good to use.
-		if conf.RPCUser != "" && conf.RPCPass != "" {
-			return nil
-		}
-
-		// Get the daemon name for displaying proper errors.
-		switch net {
-		case bitcoinChain:
-			daemonName = "btcd"
-		case litecoinChain:
-			daemonName = "ltcd"
-		}
-
-		// If only ONE of RPCUser or RPCPass is set, we assume the
-		// user did that unintentionally.
-		if conf.RPCUser != "" || conf.RPCPass != "" {
-			return fmt.Errorf("please set both or neither of "+
-				"%[1]v.rpcuser, %[1]v.rpcpass", daemonName)
-		}
-
-		switch net {
-		case bitcoinChain:
-			confDir = conf.Dir
-			confFile = "btcd"
-		case litecoinChain:
-			confDir = conf.Dir
-			confFile = "ltcd"
-		}
-	case *bitcoindConfig:
-		// If all of RPCUser, RPCPass, and ZMQPath are set, we assume
-		// those parameters are good to use.
-		if conf.RPCUser != "" && conf.RPCPass != "" && conf.ZMQPath != "" {
-			return nil
-		}
-
-		// Get the daemon name for displaying proper errors.
-		switch net {
-		case bitcoinChain:
-			daemonName = "bitcoind"
-		case litecoinChain:
-			daemonName = "litecoind"
-		}
-		// If only one or two of the parameters are set, we assume the
-		// user did that unintentionally.
-		if conf.RPCUser != "" || conf.RPCPass != "" || conf.ZMQPath != "" {
-			return fmt.Errorf("please set all or none of "+
-				"%[1]v.rpcuser, %[1]v.rpcpass, "+
-				"and %[1]v.zmqpath", daemonName)
-		}
-
-		switch net {
-		case bitcoinChain:
-			confDir = conf.Dir
-			confFile = "bitcoin"
-		case litecoinChain:
-			confDir = conf.Dir
-			confFile = "litecoin"
-		}
-	}
-
-	// If we're in simnet mode, then the running btcd instance won't read
-	// the RPC credentials from the configuration. So if lnd wasn't
-	// specified the parameters, then we won't be able to start.
-	if cConfig.SimNet {
-		str := "%v: rpcuser and rpcpass must be set to your btcd " +
-			"node's RPC parameters for simnet mode"
-		return fmt.Errorf(str, funcName)
-	}
-
-	fmt.Println("Attempting automatic RPC configuration to " + daemonName)
-
-	confFile = filepath.Join(confDir, fmt.Sprintf("%v.conf", confFile))
-	switch cConfig.Node {
-	case "btcd", "ltcd":
-		nConf := nodeConfig.(*btcdConfig)
-		rpcUser, rpcPass, err := extractBtcdRPCParams(confFile)
-		if err != nil {
-			return fmt.Errorf("unable to extract RPC credentials:"+
-				" %v, cannot start w/o RPC connection",
-				err)
-		}
-		nConf.RPCUser, nConf.RPCPass = rpcUser, rpcPass
-	case "bitcoind", "litecoind":
-		nConf := nodeConfig.(*bitcoindConfig)
-		rpcUser, rpcPass, zmqPath, err := extractBitcoindRPCParams(confFile)
-		if err != nil {
-			return fmt.Errorf("unable to extract RPC credentials:"+
-				" %v, cannot start w/o RPC connection",
-				err)
-		}
-		nConf.RPCUser, nConf.RPCPass, nConf.ZMQPath = rpcUser, rpcPass, zmqPath
-	}
-
-	fmt.Printf("Automatically obtained %v's RPC credentials\n", daemonName)
-	return nil
-}
-
-// extractBtcdRPCParams attempts to extract the RPC credentials for an existing
-// btcd instance. The passed path is expected to be the location of btcd's
-// application data directory on the target system.
-func extractBtcdRPCParams(btcdConfigPath string) (string, string, error) {
-	// First, we'll open up the btcd configuration file found at the target
-	// destination.
-	btcdConfigFile, err := os.Open(btcdConfigPath)
-	if err != nil {
-		return "", "", err
-	}
-	defer btcdConfigFile.Close()
-
-	// With the file open extract the contents of the configuration file so
-	// we can attempt to locate the RPC credentials.
-	configContents, err := ioutil.ReadAll(btcdConfigFile)
-	if err != nil {
-		return "", "", err
-	}
-
-	// Attempt to locate the RPC user using a regular expression. If we
-	// don't have a match for our regular expression then we'll exit with
-	// an error.
-	rpcUserRegexp, err := regexp.Compile(`(?m)^\s*rpcuser\s*=\s*([^\s]+)`)
-	if err != nil {
-		return "", "", err
-	}
-	userSubmatches := rpcUserRegexp.FindSubmatch(configContents)
-	if userSubmatches == nil {
-		return "", "", fmt.Errorf("unable to find rpcuser in config")
-	}
-
-	// Similarly, we'll use another regular expression to find the set
-	// rpcpass (if any). If we can't find the pass, then we'll exit with an
-	// error.
-	rpcPassRegexp, err := regexp.Compile(`(?m)^\s*rpcpass\s*=\s*([^\s]+)`)
-	if err != nil {
-		return "", "", err
-	}
-	passSubmatches := rpcPassRegexp.FindSubmatch(configContents)
-	if passSubmatches == nil {
-		return "", "", fmt.Errorf("unable to find rpcuser in config")
-	}
-
-	return string(userSubmatches[1]), string(passSubmatches[1]), nil
-}
-
-// extractBitcoindParams attempts to extract the RPC credentials for an
-// existing bitcoind node instance. The passed path is expected to be the
-// location of bitcoind's bitcoin.conf on the target system. The routine looks
-// for a cookie first, optionally following the datadir configuration option in
-// the bitcoin.conf. If it doesn't find one, it looks for rpcuser/rpcpassword.
-func extractBitcoindRPCParams(bitcoindConfigPath string) (string, string, string, error) {
-
-	// First, we'll open up the bitcoind configuration file found at the
-	// target destination.
-	bitcoindConfigFile, err := os.Open(bitcoindConfigPath)
-	if err != nil {
-		return "", "", "", err
-	}
-	defer bitcoindConfigFile.Close()
-
-	// With the file open extract the contents of the configuration file so
-	// we can attempt to locate the RPC credentials.
-	configContents, err := ioutil.ReadAll(bitcoindConfigFile)
-	if err != nil {
-		return "", "", "", err
-	}
-
-	// First, we look for the ZMQ path for raw blocks. If raw transactions
-	// are sent over this interface, we can also get unconfirmed txs.
-	zmqPathRE, err := regexp.Compile(`(?m)^\s*zmqpubrawblock\s*=\s*([^\s]+)`)
-	if err != nil {
-		return "", "", "", err
-	}
-	zmqPathSubmatches := zmqPathRE.FindSubmatch(configContents)
-	if len(zmqPathSubmatches) < 2 {
-		return "", "", "", fmt.Errorf("unable to find zmqpubrawblock in config")
-	}
-
-	// Next, we'll try to find an auth cookie. We need to detect the chain
-	// by seeing if one is specified in the configuration file.
-	dataDir := path.Dir(bitcoindConfigPath)
-	dataDirRE, err := regexp.Compile(`(?m)^\s*datadir\s*=\s*([^\s]+)`)
-	if err != nil {
-		return "", "", "", err
-	}
-	dataDirSubmatches := dataDirRE.FindSubmatch(configContents)
-	if dataDirSubmatches != nil {
-		dataDir = string(dataDirSubmatches[1])
-	}
-
-	chainDir := "/"
-	switch activeNetParams.Params.Name {
-	case "testnet3":
-		chainDir = "/testnet3/"
-	case "testnet4":
-		chainDir = "/testnet4/"
-	case "regtest":
-		chainDir = "/regtest/"
-	}
-
-	cookie, err := ioutil.ReadFile(dataDir + chainDir + ".cookie")
-	if err == nil {
-		splitCookie := strings.Split(string(cookie), ":")
-		if len(splitCookie) == 2 {
-			return splitCookie[0], splitCookie[1],
-				string(zmqPathSubmatches[1]), nil
-		}
-	}
-
-	// We didn't find a cookie, so we attempt to locate the RPC user using
-	// a regular expression. If we  don't have a match for our regular
-	// expression then we'll exit with an error.
-	rpcUserRegexp, err := regexp.Compile(`(?m)^\s*rpcuser\s*=\s*([^\s]+)`)
-	if err != nil {
-		return "", "", "", err
-	}
-	userSubmatches := rpcUserRegexp.FindSubmatch(configContents)
-	if userSubmatches == nil {
-		return "", "", "", fmt.Errorf("unable to find rpcuser in config")
-	}
-
-	// Similarly, we'll use another regular expression to find the set
-	// rpcpass (if any). If we can't find the pass, then we'll exit with an
-	// error.
-	rpcPassRegexp, err := regexp.Compile(`(?m)^\s*rpcpassword\s*=\s*([^\s]+)`)
-	if err != nil {
-		return "", "", "", err
-	}
-	passSubmatches := rpcPassRegexp.FindSubmatch(configContents)
-	if passSubmatches == nil {
-		return "", "", "", fmt.Errorf("unable to find rpcpassword in config")
-	}
-
-	return string(userSubmatches[1]), string(passSubmatches[1]),
-		string(zmqPathSubmatches[1]), nil
-}
-
 // normalizeAddresses returns a new slice with all the passed addresses
 // normalized with the given default port and all duplicates removed.
 func normalizeAddresses(addrs []string, defaultPort string) []string {
@@ -1172,4 +931,38 @@ func normalizeNetwork(network string) string {
 	}
 
 	return network
+}
+
+// Backend returns the current backend for the config
+func (cfg *config) Backend() (Backend, error) {
+
+	homeChainConfig := cfg.Bitcoin
+	if registeredChains.PrimaryChain() == litecoinChain {
+		homeChainConfig = cfg.Litecoin
+	}
+
+	switch homeChainConfig.Node {
+	case "neutrino":
+		return cfg.NeutrinoMode, nil
+
+	case "btcd", "ltcd":
+
+		switch {
+		case cfg.Bitcoin.Active:
+			return cfg.BtcdMode, nil
+		case cfg.Litecoin.Active:
+			return cfg.LtcdMode, nil
+		}
+
+	case "bitcoind", "litecoind":
+
+		switch {
+		case cfg.Bitcoin.Active:
+			return cfg.BitcoindMode, nil
+		case cfg.Litecoin.Active:
+			return cfg.LitecoindMode, nil
+		}
+	}
+
+	return nil, fmt.Errorf("unknown node type: %s", homeChainConfig.Node)
 }

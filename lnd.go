@@ -264,10 +264,17 @@ func lndMain() error {
 		}
 	}
 
+	var backend Backend
+
+	if backend, err = cfg.Backend(); err != nil {
+		fmt.Printf("unable to get backend: %vn", err)
+		return err
+	}
+
 	// With the information parsed from the configuration, create valid
 	// instances of the pertinent interfaces required to operate the
 	// Lightning Network Daemon.
-	activeChainControl, chainCleanUp, err := newChainControlFromConfig(
+	activeChainControl, chainCleanUp, err := backend.NewChainControlFromConfig(
 		cfg, chanDB, privateWalletPw, publicWalletPw, birthday,
 		recoveryWindow,
 	)
